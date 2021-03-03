@@ -1,0 +1,512 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <WiFiClient.h>
+#include "EEPROM.h"
+#include <ESPUI.h>
+#include "dataconverter.h"
+
+dataConverterUnion dataConverter;
+
+/*** Soft AP Parameters ***/
+const char *apSSID = "VOLMON-IoT";
+const char *apPass = "12345678";
+IPAddress apIP(192, 168, 1, 1);
+
+/*** Network Parameters ***/
+const char *hostname = "VOLMON-IoT";
+
+/*** Pinout Mapping ***/
+const int8_t SENSOR_RXD = 16; // RXD2 @GPIO16 -> TXD MeasureCore
+const int8_t SENSOR_TXD = 17; // TXD2 @GPIO17 -> RXD MeasureCore
+const int8_t SENSOR_IO0 = 5;
+const int8_t SENSOR_IO1 = 18;
+const int8_t SENSOR_IO2 = 19;
+const int8_t LED_ACT = 33;
+const int8_t LED_LINK = 32;
+const int8_t BUZZER = 25;
+
+/*** Definitions ***/
+/* Index */
+#define AC_PHASE_R 0
+#define AC_PHASE_S 1
+#define AC_PHASE_T 2
+
+/* Sensor */
+#define SensorCore Serial2
+#define SENSOR_RX_BUFFER_SIZE 100
+#define SENSOR_CMD_HEADER 0x5A
+#define SENSOR_CMD_REPLY_HEADER 0xA5
+
+#define SENSOR_CMD_READ_MEASUREMENT 0xA0
+#define SENSOR_CMD_READ_MEASUREMENT_DATAVAL 0xAA
+#define SENSOR_CMD_READ_MEASUREMENT_REPLY_DATALEN 8
+
+#define SENSOR_CMD_RUN_CALIBRATION 0xC0
+#define SENSOR_CMD_RUN_CALIBRATION_REPLY_DATALEN 1
+
+#define SENSOR_PASSWORD_BYTE2 0xC0
+#define SENSOR_PASSWORD_BYTE1 0xFF
+#define SENSOR_PASSWORD_BYTE0 0xEE
+
+#define CALIB_AC_VOLT_VALUE 2500   // 250.0 VAC
+#define CALIB_AC_FREQ_VALUE 5000   // 50.00 Hz
+#define CALIB_TIMEOUT_PRESET 20000 // 20 seconds
+
+/* Calibration States */
+#define CALIB_STANDBY 0
+#define CALIB_STARTING 1
+#define CALIB_RUNNING 2
+#define CALIB_SUCCESS 3
+#define CALIB_FAILED 4
+#define CALIB_TIMEOUT 5
+
+/*** Variables ***/
+/* Sensor */
+unsigned char sensorPacketChecksum;
+unsigned char sensorRxBuffer[SENSOR_RX_BUFFER_SIZE];
+unsigned char sensorRxPointer;
+unsigned char sensorRxCount;
+boolean sensorPacketReceived = false;
+float acVolt[3]; // AC Voltage Phase R, Phase S and Phase T
+float acFreq;    // AC Frequency
+volatile unsigned int tempData;
+unsigned long calibrationStartTime = 0; // For Sensor Calibration Timeout
+volatile unsigned char calibrationState = CALIB_STANDBY;
+
+/* Network */
+char ssid[16];
+char password[16];
+char temp_ssid[16];
+char temp_password[16];
+unsigned long packetCounter = 0;
+unsigned char networkTimeout = 20;
+
+/* ERPROM */
+int eepromAddress = 0;
+
+/* ESPUI - GUI */
+int acVoltLabelId[3];
+int acFreqLabelId;
+int millisLabelId;
+int calibrationStatusId;
+int calibrationButtonId;
+int wifiSSIDTextID;
+int wifiPasswordTextID;
+int saveConfigButtonId;
+
+/*** Function Prototypes ***/
+void sensorReadMeasurement(void);
+void sensorRunCalibration(void);
+void sensorCoreEvent(void);
+void sensorPacketProcess(void);
+void textCall(Control *sender, int type);
+void buttonCall(Control *sender, int type);
+
+void setup()
+{
+    /* Configure GPIO Pins */
+    digitalWrite(BUZZER, HIGH);
+    digitalWrite(LED_ACT, HIGH);
+    digitalWrite(LED_LINK, HIGH);
+
+    pinMode(LED_ACT, OUTPUT);
+    pinMode(LED_LINK, OUTPUT);
+
+    pinMode(BUZZER, OUTPUT);
+    pinMode(SENSOR_IO0, INPUT_PULLUP);
+    pinMode(SENSOR_IO1, INPUT_PULLUP);
+
+    // Initialize Serial for Debug
+    Serial.begin(115200);
+
+    // Show Startup Message
+    Serial.println("************************************");
+    Serial.println("*     VOLMON-IoT Type A V1.0       *");
+    Serial.println("*     3-Phase AC Measurement       *");
+    Serial.println("*             Wi-Fi                *");
+    Serial.println("************************************");
+
+    // Load Settings
+    Serial.println("*** Load Parameters ***");
+    if (!EEPROM.begin(64))
+    {
+        Serial.println("Failed to initialise EEPROM");
+    }
+    EEPROM.readString(eepromAddress).toCharArray(ssid, sizeof(ssid));
+    eepromAddress += sizeof(ssid);
+    EEPROM.readString(eepromAddress).toCharArray(password, sizeof(password));
+
+    Serial.print("SSID:");
+    Serial.println(ssid);
+    Serial.print("Password:");
+    Serial.println(password);
+
+    // Initialize UART2 for Sensor Communication
+    SensorCore.begin(115200, SERIAL_8N1, SENSOR_RXD, SENSOR_TXD);
+
+    // Initialize Rx Pointer and Counter
+    sensorRxPointer = 0;
+    sensorRxCount = 0;
+
+    ESPUI.setVerbosity(Verbosity::VerboseJSON);
+    WiFi.setHostname(hostname);
+
+    if (strcmp(ssid, "") != 0)
+    {
+        // try to connect to existing network
+        WiFi.begin(ssid, password);
+        Serial.print("\n\nTry to connect to existing network");
+
+        // Wait for connection, 20s timeout
+        networkTimeout = 10;
+        do
+        {
+            delay(1000);
+            Serial.print(".");
+            networkTimeout--;
+        } while (networkTimeout && WiFi.status() != WL_CONNECTED);
+    }
+    else
+    {
+        Serial.println("No SSID and Password found. Start in Soft AP Mode");
+    }
+
+    // not connected -> create hotspot
+    if (WiFi.status() != WL_CONNECTED)
+    {
+        Serial.print("\n\nCreating hotspot");
+
+        WiFi.mode(WIFI_AP);
+        WiFi.softAPConfig(apIP, apIP, IPAddress(255, 255, 255, 0));
+        WiFi.softAP(apSSID, apPass);
+
+        networkTimeout = 5;
+
+        do
+        {
+            delay(500);
+            Serial.print(".");
+            networkTimeout--;
+        } while (networkTimeout);
+
+        digitalWrite(BUZZER, LOW);
+        delay(300);
+        digitalWrite(BUZZER, HIGH);
+    }
+    else
+    {
+        digitalWrite(BUZZER, LOW);
+        delay(100);
+        digitalWrite(BUZZER, HIGH);
+        delay(100);
+
+        digitalWrite(BUZZER, LOW);
+        delay(100);
+        digitalWrite(BUZZER, HIGH);
+        delay(100);
+    }
+
+    Serial.println("\n\nWiFi parameters:");
+    Serial.print("Mode: ");
+    Serial.println(WiFi.getMode() == WIFI_AP ? "Station" : "Client");
+    Serial.print("IP address: ");
+    Serial.println(WiFi.getMode() == WIFI_AP ? WiFi.softAPIP() : WiFi.localIP());
+
+    Serial.println("Setup DONE!");
+
+    /* Generate UI */
+    acVoltLabelId[0] = ESPUI.label("AC Voltage R:", ControlColor::Turquoise, "0.0 V");
+    acVoltLabelId[1] = ESPUI.label("AC Voltage S:", ControlColor::Turquoise, "0.0 V");
+    acVoltLabelId[2] = ESPUI.label("AC Voltage T:", ControlColor::Turquoise, "0.0 V");
+    acFreqLabelId = ESPUI.label("AC Frequency", ControlColor::Carrot, "0.00 Hz");
+    millisLabelId = ESPUI.label("Millis:", ControlColor::Emerald, "0");
+    calibrationStatusId = ESPUI.label("Calibration Status", ControlColor::Sunflower, "STANDBY");
+    calibrationButtonId = ESPUI.button("Calibration", &buttonCall, ControlColor::Alizarin, "Start");
+    wifiSSIDTextID = ESPUI.text("SSID", &textCall, ControlColor::Wetasphalt, "");
+    wifiPasswordTextID = ESPUI.text("Password", &textCall, ControlColor::Wetasphalt, "");
+    saveConfigButtonId = ESPUI.button("Configuration", &buttonCall, ControlColor::Wetasphalt, "Save");
+    ESPUI.begin("VOLMON-IoT - Dashboard");
+
+    /* Sync UI */
+    ESPUI.updateText(wifiSSIDTextID, String(ssid));
+    ESPUI.updateText(wifiPasswordTextID, String(password));
+}
+
+void loop()
+{
+    static unsigned long oldTime = 0;
+    static unsigned long oldSensorTime = 0;
+    if (calibrationState == CALIB_STARTING)
+    {
+        sensorRunCalibration();
+        calibrationState = CALIB_RUNNING;
+    }
+    else if (calibrationState == CALIB_RUNNING)
+    {
+        if (millis() - calibrationStartTime >= CALIB_TIMEOUT_PRESET)
+        {
+            calibrationState = CALIB_TIMEOUT;
+        }
+    }
+    else
+    {
+        if (millis() - oldSensorTime >= 1000)
+        {
+            oldSensorTime = millis();
+            sensorReadMeasurement();
+        }
+    }
+
+    if (millis() - oldTime >= 2000)
+    {
+        oldTime = millis();
+        if (calibrationState != CALIB_RUNNING)
+        {
+            ESPUI.print(acVoltLabelId[0], String(acVolt[AC_PHASE_R]) + " V");
+            ESPUI.print(acVoltLabelId[1], String(acVolt[AC_PHASE_S]) + " V");
+            ESPUI.print(acVoltLabelId[2], String(acVolt[AC_PHASE_T]) + " V");
+            ESPUI.print(acFreqLabelId, String(acFreq) + " Hz");
+        }
+        ESPUI.print(millisLabelId, String(millis()));
+        switch (calibrationState)
+        {
+        case CALIB_STANDBY:
+            ESPUI.print(calibrationStatusId, "STANDBY");
+            break;
+        case CALIB_STARTING:
+            ESPUI.print(calibrationStatusId, "STARTING");
+            break;
+        case CALIB_RUNNING:
+            ESPUI.print(calibrationStatusId, "RUNNING");
+            break;
+        case CALIB_SUCCESS:
+            ESPUI.print(calibrationStatusId, "SUCCESS");
+            break;
+        case CALIB_FAILED:
+            ESPUI.print(calibrationStatusId, "FAILED");
+            break;
+        case CALIB_TIMEOUT:
+            ESPUI.print(calibrationStatusId, "TIMEOUT");
+            break;
+        }
+    }
+
+    sensorCoreEvent();
+    sensorPacketProcess();
+}
+
+void sensorReadMeasurement(void)
+{
+    SensorCore.write(SENSOR_CMD_HEADER);
+    sensorPacketChecksum = SENSOR_CMD_HEADER;
+    SensorCore.write(SENSOR_CMD_READ_MEASUREMENT);
+    sensorPacketChecksum += SENSOR_CMD_READ_MEASUREMENT;
+    SensorCore.write(SENSOR_CMD_READ_MEASUREMENT_DATAVAL);
+    sensorPacketChecksum += SENSOR_CMD_READ_MEASUREMENT_DATAVAL;
+    SensorCore.write(sensorPacketChecksum);
+}
+
+void sensorRunCalibration(void)
+{
+    SensorCore.write(SENSOR_CMD_HEADER);
+    sensorPacketChecksum = SENSOR_CMD_HEADER;
+    SensorCore.write(SENSOR_CMD_RUN_CALIBRATION);
+    sensorPacketChecksum += SENSOR_CMD_RUN_CALIBRATION;
+    SensorCore.write(SENSOR_PASSWORD_BYTE2);
+    sensorPacketChecksum += SENSOR_PASSWORD_BYTE2;
+    SensorCore.write(SENSOR_PASSWORD_BYTE1);
+    sensorPacketChecksum += SENSOR_PASSWORD_BYTE1;
+    SensorCore.write(SENSOR_PASSWORD_BYTE0);
+    sensorPacketChecksum += SENSOR_PASSWORD_BYTE0;
+    dataConverter.u16_d[1] = (uint16_t)CALIB_AC_VOLT_VALUE;
+    dataConverter.u16_d[0] = (uint16_t)CALIB_AC_FREQ_VALUE;
+    SensorCore.write(dataConverter.u8_d[3]);
+    SensorCore.write(dataConverter.u8_d[2]);
+    sensorPacketChecksum += dataConverter.u8_d[3];
+    sensorPacketChecksum += dataConverter.u8_d[2];
+    SensorCore.write(dataConverter.u8_d[3]);
+    SensorCore.write(dataConverter.u8_d[2]);
+    sensorPacketChecksum += dataConverter.u8_d[3];
+    sensorPacketChecksum += dataConverter.u8_d[2];
+    SensorCore.write(dataConverter.u8_d[3]);
+    SensorCore.write(dataConverter.u8_d[2]);
+    sensorPacketChecksum += dataConverter.u8_d[3];
+    sensorPacketChecksum += dataConverter.u8_d[2];
+    SensorCore.write(dataConverter.u8_d[1]);
+    SensorCore.write(dataConverter.u8_d[0]);
+    sensorPacketChecksum += dataConverter.u8_d[1];
+    sensorPacketChecksum += dataConverter.u8_d[0];
+    SensorCore.write(sensorPacketChecksum);
+    calibrationStartTime = millis();
+}
+
+void sensorCoreEvent(void)
+{
+    static unsigned int replyDatalen;
+    if (SensorCore.available())
+    {
+        unsigned char dataByte = (unsigned char)SensorCore.read();
+        if (sensorRxPointer == 0)
+        {
+            if (dataByte == SENSOR_CMD_REPLY_HEADER)
+            {
+                sensorRxBuffer[sensorRxPointer++] = dataByte;
+                sensorPacketChecksum = dataByte;
+            }
+            else
+            {
+                sensorRxPointer = 0;
+            }
+        }
+        else if (sensorRxPointer == 1)
+        {
+            if (dataByte == SENSOR_CMD_READ_MEASUREMENT)
+            {
+                sensorRxBuffer[sensorRxPointer++] = dataByte;
+                sensorPacketChecksum += dataByte;
+                replyDatalen = SENSOR_CMD_READ_MEASUREMENT_REPLY_DATALEN;
+            }
+            else if (dataByte == SENSOR_CMD_RUN_CALIBRATION)
+            {
+                sensorRxBuffer[sensorRxPointer++] = dataByte;
+                sensorPacketChecksum += dataByte;
+                replyDatalen = SENSOR_CMD_RUN_CALIBRATION_REPLY_DATALEN;
+            }
+            else
+            {
+                sensorRxPointer = 0;
+            }
+        }
+        else if (sensorRxPointer < replyDatalen + 3 - 1)
+        {
+            sensorRxBuffer[sensorRxPointer++] = dataByte;
+            sensorPacketChecksum += dataByte;
+        }
+        else
+        {
+            sensorRxBuffer[sensorRxPointer] = dataByte;
+            if (sensorRxBuffer[sensorRxPointer] == sensorPacketChecksum)
+            {
+                sensorPacketReceived = true;
+                sensorRxPointer = 0;
+            }
+            else
+            {
+                sensorPacketReceived = false;
+                sensorRxPointer = 0;
+            }
+        }
+    }
+}
+
+void sensorPacketProcess(void)
+{
+    if (sensorPacketReceived)
+    {
+        if (sensorRxBuffer[1] == SENSOR_CMD_READ_MEASUREMENT)
+        {
+            // AC Voltage Phase R
+            tempData = ((unsigned int)sensorRxBuffer[2]) << 8;
+            tempData |= (unsigned int)sensorRxBuffer[3];
+            acVolt[AC_PHASE_R] = (float)tempData / 10.0f;
+
+            // AC Voltage Phase S
+            tempData = ((unsigned int)sensorRxBuffer[4]) << 8;
+            tempData |= (unsigned int)sensorRxBuffer[5];
+            acVolt[AC_PHASE_S] = (float)tempData / 10.0f;
+
+            // AC Voltage Phase T
+            tempData = ((unsigned int)sensorRxBuffer[6]) << 8;
+            tempData |= (unsigned int)sensorRxBuffer[7];
+            acVolt[AC_PHASE_T] = (float)tempData / 10.0f;
+
+            // AC Frequency
+            tempData = ((unsigned int)sensorRxBuffer[8]) << 8;
+            tempData |= (unsigned int)sensorRxBuffer[9];
+            acFreq = (float)tempData / 100.0f;
+        }
+        else if (sensorRxBuffer[1] == SENSOR_CMD_RUN_CALIBRATION)
+        {
+            if (sensorRxBuffer[2] == 0)
+            {
+                calibrationState = CALIB_SUCCESS;
+            }
+            else
+            {
+                calibrationState = CALIB_FAILED;
+            }
+        }
+
+        Serial.print(packetCounter++);
+        Serial.print(";");
+        Serial.print(millis());
+        Serial.print(";");
+        Serial.print(acVolt[AC_PHASE_R], 1);
+        Serial.print(";");
+        Serial.print(acVolt[AC_PHASE_S], 1);
+        Serial.print(";");
+        Serial.print(acVolt[AC_PHASE_T], 1);
+        Serial.print(";");
+        Serial.println(acFreq, 2);
+
+        sensorPacketReceived = false;
+    }
+}
+
+void buttonCall(Control *sender, int type)
+{
+    if (type == B_DOWN)
+    {
+        if (sender->id == calibrationButtonId)
+        {
+            if (calibrationState == CALIB_STANDBY)
+            {
+                calibrationState = CALIB_STARTING;
+            }
+            else if (calibrationState == CALIB_SUCCESS || calibrationState == CALIB_FAILED || calibrationState == CALIB_TIMEOUT)
+            {
+                calibrationState = CALIB_STANDBY;
+            }
+        }
+        else if (sender->id == saveConfigButtonId)
+        {
+            // if (strcmp(temp_ssid, "") > 0)
+            // {
+            ESPUI.getControl(wifiSSIDTextID)->value.toCharArray(temp_ssid, sizeof(temp_ssid));
+            ESPUI.getControl(wifiPasswordTextID)->value.toCharArray(temp_password, sizeof(temp_password));
+
+            Serial.print("T_SSID:");
+            Serial.println(temp_ssid);
+            Serial.print("T_Password:");
+            Serial.println(temp_password);
+
+            Serial.print("SSID:");
+            Serial.println(ssid);
+            Serial.print("Password:");
+            Serial.println(password);
+
+            eepromAddress = 0;
+            EEPROM.writeString(eepromAddress, String(temp_ssid));
+            eepromAddress += sizeof(temp_ssid);
+            EEPROM.writeString(eepromAddress, String(temp_password));
+            EEPROM.commit();
+
+            digitalWrite(BUZZER, LOW);
+            delay(100);
+            digitalWrite(BUZZER, HIGH);
+            // }
+        }
+    }
+}
+
+void textCall(Control *sender, int type)
+{
+    if (sender->id == wifiSSIDTextID)
+    {
+        sender->value.toCharArray(temp_ssid, sizeof(temp_ssid));
+    }
+    else if (sender->id == wifiPasswordTextID)
+    {
+        sender->value.toCharArray(temp_password, sizeof(temp_password));
+    }
+}
